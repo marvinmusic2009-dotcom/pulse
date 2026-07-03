@@ -1,4 +1,6 @@
-# React + TypeScript + Vite
+# Pulse
+
+School sick bay management app built with React + TypeScript + Vite, with Capacitor Android support.
 
 This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
 
