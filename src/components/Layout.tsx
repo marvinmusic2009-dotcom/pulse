@@ -33,9 +33,29 @@ export default function Layout({
   const [currentUser, setCurrentUser] = useState<User>(user);
   const [isSidebarCollapsed, setSidebarCollapsed] = useState(false);
 
+  const [unreadChatsCount, setUnreadChatsCount] = useState(0);
+  const [activeToast, setActiveToast] = useState<{ id: string; title: string; description: string; type: 'chat' | 'reminder'; count: number } | null>(null);
+
   const knownReminderIds = React.useRef<Set<string>>(new Set());
   const knownChatMessageIds = React.useRef<Set<string>>(new Set());
   const knownPendingUserIds = React.useRef<Set<string>>(new Set());
+
+  // Reset unread chats count when viewing the chat room
+  useEffect(() => {
+    if (activeTab === 'chat') {
+      setUnreadChatsCount(0);
+    }
+  }, [activeTab]);
+
+  // Auto-dismiss in-app notification toasts
+  useEffect(() => {
+    if (activeToast) {
+      const timer = setTimeout(() => {
+        setActiveToast(null);
+      }, 6000);
+      return () => clearTimeout(timer);
+    }
+  }, [activeToast]);
 
   // Initialize notification trackers and request permissions on mount
   useEffect(() => {
@@ -58,9 +78,14 @@ export default function Layout({
 
   // Monitor new reminders
   useEffect(() => {
+    let newReminderDetected = false;
+    let lastRem: any = null;
+
     reminders.forEach(rem => {
       if (!knownReminderIds.current.has(rem.id)) {
         knownReminderIds.current.add(rem.id);
+        newReminderDetected = true;
+        lastRem = rem;
         
         let category: 'visitRequests' | 'medicationReminders' | 'lowStockAlerts' = 'lowStockAlerts';
         if (rem.type === 'missed_dose') category = 'medicationReminders';
@@ -73,6 +98,16 @@ export default function Layout({
         );
       }
     });
+
+    if (newReminderDetected && lastRem) {
+      setActiveToast({
+        id: lastRem.id,
+        title: lastRem.title,
+        description: lastRem.description,
+        type: 'reminder',
+        count: reminders.length
+      });
+    }
   }, [reminders]);
 
   // Monitor new chat messages and pending join requests
@@ -80,33 +115,74 @@ export default function Layout({
     const checkNewChatsAndApprovals = () => {
       // 1. Check chat messages
       const currentChats = dbService.getChatMessages(user.school_id);
+      let newChatDetected = false;
+      let lastMsg: any = null;
+      let newChatsCount = 0;
+
       currentChats.forEach(msg => {
         if (!knownChatMessageIds.current.has(msg.id)) {
           knownChatMessageIds.current.add(msg.id);
           // Only notify if message is sent by someone else
           if (msg.sender_id !== user.id) {
-            notificationService.sendNotification(
-              `New message from ${msg.sender_name}`,
-              msg.content,
-              'chatMessages'
-            );
+            newChatDetected = true;
+            lastMsg = msg;
+            newChatsCount++;
           }
         }
       });
 
+      if (newChatDetected && lastMsg) {
+        // Increment unread chat count if not currently looking at the Chat tab
+        if (activeTab !== 'chat') {
+          setUnreadChatsCount(prev => {
+            const nextCount = prev + newChatsCount;
+            setActiveToast({
+              id: lastMsg.id,
+              title: `New Message from ${lastMsg.sender_name}`,
+              description: lastMsg.content,
+              type: 'chat',
+              count: nextCount
+            });
+            return nextCount;
+          });
+        }
+        
+        notificationService.sendNotification(
+          `New message from ${lastMsg.sender_name}`,
+          lastMsg.content,
+          'chatMessages'
+        );
+      }
+
       // 2. Check pending approvals if user is Admin
       if (user.role === 'Admin') {
         const currentPending = dbService.getPendingUsers(user.school_id);
+        let newPendingDetected = false;
+        let lastUser: any = null;
+
         currentPending.forEach(u => {
           if (!knownPendingUserIds.current.has(u.id)) {
             knownPendingUserIds.current.add(u.id);
-            notificationService.sendNotification(
-              "New Access Request",
-              `${u.full_name} is requesting access as a ${u.role}.`,
-              'visitRequests'
-            );
+            newPendingDetected = true;
+            lastUser = u;
           }
         });
+
+        if (newPendingDetected && lastUser) {
+          setActiveToast({
+            id: lastUser.id,
+            title: "New Access Request",
+            description: `${lastUser.full_name} is requesting access as a ${lastUser.role}.`,
+            type: 'reminder',
+            count: currentPending.length
+          });
+
+          notificationService.sendNotification(
+            "New Access Request",
+            `${lastUser.full_name} is requesting access as a ${lastUser.role}.`,
+            'visitRequests'
+          );
+        }
       }
     };
 
@@ -119,7 +195,7 @@ export default function Layout({
       window.removeEventListener('pulse-db-synced', checkNewChatsAndApprovals);
       window.removeEventListener('pulse-db-updated', checkNewChatsAndApprovals);
     };
-  }, [user.school_id, user.id, user.role]);
+  }, [user.school_id, user.id, user.role, activeTab]);
 
   // Sync state and listen for updates
   useEffect(() => {
@@ -310,6 +386,11 @@ export default function Layout({
               >
                 <Icon className="w-5 h-5 flex-shrink-0" />
                 <span>{item.name}</span>
+                {item.id === 'chat' && unreadChatsCount > 0 && (
+                  <span className="ml-auto inline-flex items-center justify-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-primary text-white animate-pulse">
+                    {unreadChatsCount}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -365,7 +446,9 @@ export default function Layout({
           >
             <Bell className="w-5 h-5 text-slate-300" />
             {reminders.length > 0 && (
-              <span className="absolute top-1 right-1 w-2.5 h-2.5 bg-rose-500 rounded-full border border-slate-900" />
+              <span className="absolute -top-1 -right-1 min-w-5 h-5 flex items-center justify-center px-1 py-0.5 rounded-full text-[8px] font-bold bg-rose-500 text-white border border-slate-900 animate-pulse">
+                {reminders.length}
+              </span>
             )}
           </button>
           <button
@@ -424,6 +507,11 @@ export default function Layout({
                   >
                     <Icon className="w-5 h-5 flex-shrink-0" />
                     <span>{item.name}</span>
+                    {item.id === 'chat' && unreadChatsCount > 0 && (
+                      <span className="ml-auto inline-flex items-center justify-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-primary text-white">
+                        {unreadChatsCount}
+                      </span>
+                    )}
                   </button>
                 );
               })}
@@ -512,7 +600,9 @@ export default function Layout({
               >
                 <Bell className="w-5 h-5" />
                 {reminders.length > 0 && (
-                  <span className="absolute top-1.5 right-1.5 w-2.5 h-2.5 bg-rose-500 rounded-full border-2 border-white animate-pulse" />
+                  <span className="absolute -top-1.5 -right-1.5 min-w-5 h-5 flex items-center justify-center px-1.5 rounded-full text-[9px] font-bold bg-rose-500 text-white border-2 border-white animate-pulse">
+                    {reminders.length}
+                  </span>
                 )}
               </button>
 
@@ -619,6 +709,49 @@ export default function Layout({
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* IN-APP TOAST POPUP NOTIFICATION */}
+      {activeToast && (
+        <div className="fixed bottom-5 right-5 z-50 bg-slate-900 text-white p-4 rounded-2xl shadow-2xl border border-slate-800 max-w-sm flex items-start gap-3 animate-fade-in-right">
+          <div className="p-2 bg-primary/10 text-primary rounded-xl flex-shrink-0 mt-0.5">
+            {activeToast.type === 'chat' ? <MessageSquare className="w-5 h-5" /> : <Bell className="w-5 h-5" />}
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-bold text-slate-200 block truncate">{activeToast.title}</span>
+              <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-rose-500 text-white animate-pulse">
+                {activeToast.count}
+              </span>
+            </div>
+            <p className="text-xs text-slate-400 mt-1 line-clamp-2 leading-relaxed">{activeToast.description}</p>
+            
+            <div className="flex gap-2 mt-3 pt-2.5 border-t border-slate-800">
+              <button
+                onClick={() => {
+                  if (activeToast.type === 'chat') {
+                    setActiveTab('chat');
+                  } else {
+                    setShowNotifications(true);
+                  }
+                  setActiveToast(null);
+                }}
+                className="px-3 py-1 bg-primary hover:bg-primary-hover text-white rounded-lg text-[10px] font-bold transition flex items-center gap-1"
+              >
+                <span>View</span>
+              </button>
+              <button
+                onClick={() => setActiveToast(null)}
+                className="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-[10px] font-semibold transition"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+          <button onClick={() => setActiveToast(null)} className="text-slate-500 hover:text-slate-300 transition flex-shrink-0">
+            <X className="w-4 h-4" />
+          </button>
         </div>
       )}
     </div>
