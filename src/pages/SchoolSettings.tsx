@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { dbService, applySchoolBranding } from '../services/db';
+import { notificationService } from '../services/notificationService';
 import type { User, School } from '../services/db';
 import { 
   Save, CheckCircle, Image as ImageIcon, Palette, User as UserIcon,
-  Building, RefreshCw, Phone, Mail, MapPin, Sliders, Info, Upload
+  Building, RefreshCw, Phone, Mail, MapPin, Sliders, Info, Upload, Bell
 } from 'lucide-react';
 
 interface SchoolSettingsProps {
@@ -40,6 +41,13 @@ export default function SchoolSettings({ user }: SchoolSettingsProps) {
 
   // Alert Thresholds Tab Fields
   const [lowStockLimit, setLowStockLimit] = useState(20);
+
+  // Push / Local Notification States
+  const [notifEnabled, setNotifEnabled] = useState(true);
+  const [notifVisits, setNotifVisits] = useState(true);
+  const [notifMeds, setNotifMeds] = useState(true);
+  const [notifStock, setNotifStock] = useState(true);
+  const [notifChat, setNotifChat] = useState(true);
 
   // Cloud Sync Tab Fields
   const [cloudSyncEnabled, setCloudSyncEnabled] = useState(false);
@@ -98,6 +106,14 @@ export default function SchoolSettings({ user }: SchoolSettingsProps) {
       setCloudSyncToken(sc.cloud_sync_token || '');
     }
 
+    // Load notification preferences
+    const ns = notificationService.loadSettings();
+    setNotifEnabled(ns.enabled);
+    setNotifVisits(ns.visitRequests);
+    setNotifMeds(ns.medicationReminders);
+    setNotifStock(ns.lowStockAlerts);
+    setNotifChat(ns.chatMessages);
+
     // Load active user fresh avatar
     const savedUserStr = localStorage.getItem('pulse_current_user');
     if (savedUserStr) {
@@ -147,6 +163,36 @@ export default function SchoolSettings({ user }: SchoolSettingsProps) {
       if (activeSettingsTab === 'profile') {
         dbService.updateUserAvatar(user.id, avatarUrl);
         setSuccessMsg('Your profile picture has been updated successfully!');
+      } else if (activeSettingsTab === 'alerts') {
+        // Save personal notifications configuration
+        notificationService.saveSettings({
+          enabled: notifEnabled,
+          visitRequests: notifVisits,
+          medicationReminders: notifMeds,
+          lowStockAlerts: notifStock,
+          chatMessages: notifChat,
+        });
+
+        // Save school low stock alert if admin
+        if (isAdmin) {
+          dbService.updateSchool(schoolId, {
+            name,
+            logo_url: logo,
+            primary_color: primaryColor,
+            secondary_color: secondaryColor,
+            theme_preset: themePreset,
+            font_preset: fontPreset,
+            custom_css: customCss,
+            clinic_address: clinicAddress,
+            clinic_email: clinicEmail,
+            clinic_phone: clinicPhone,
+            clinic_beds: clinicBeds,
+            low_stock_limit: lowStockLimit,
+            cloud_sync_enabled: cloudSyncEnabled,
+            cloud_sync_token: cloudSyncToken,
+          });
+        }
+        setSuccessMsg('Notification preferences and safety alert policies updated successfully!');
       } else {
         // Admin school settings
         dbService.updateSchool(schoolId, {
@@ -246,7 +292,7 @@ export default function SchoolSettings({ user }: SchoolSettingsProps) {
               { id: 'profile', label: 'My Profile Card', icon: UserIcon, roles: ['Admin', 'Nurse', 'Doctor', 'Clerk'] },
               { id: 'branding', label: 'Branding & Styling', icon: Palette, roles: ['Admin'] },
               { id: 'facilities', label: 'Clinic Facilities', icon: Building, roles: ['Admin'] },
-              { id: 'alerts', label: 'Alert Policies', icon: Sliders, roles: ['Admin'] },
+              { id: 'alerts', label: 'Notification Settings', icon: Sliders, roles: ['Admin', 'Nurse', 'Doctor', 'Clerk'] },
               { id: 'cloud', label: 'Cloud Synchronization', icon: RefreshCw, roles: ['Admin'] },
             ]
               .filter(t => t.roles.includes(user.role))
@@ -559,26 +605,129 @@ export default function SchoolSettings({ user }: SchoolSettingsProps) {
               )}
 
               {/* TAB 3: ALERTS */}
-              {activeSettingsTab === 'alerts' && isAdmin && (
-                <div className="space-y-5 animate-fade-slide-up">
-                  <div className="space-y-1 border-b pb-3 mb-4 flex items-center gap-2">
-                    <Sliders className="w-5 h-5 text-slate-500" />
-                    <span className="font-bold text-slate-800 text-sm">Clinic Safety Alert Thresholds</span>
-                  </div>
+              {activeSettingsTab === 'alerts' && (
+                <div className="space-y-6 animate-fade-slide-up">
+                  {/* Part 1: Admin Alert Thresholds */}
+                  {isAdmin && (
+                    <div className="space-y-4">
+                      <div className="space-y-1 border-b pb-3 flex items-center gap-2">
+                        <Sliders className="w-5 h-5 text-slate-500" />
+                        <span className="font-bold text-slate-800 text-sm">Clinic Safety Alert Thresholds</span>
+                      </div>
 
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">Pharmacy Low Stock Warning Trigger (Count)</label>
-                    <input
-                      type="number"
-                      min={1}
-                      value={lowStockLimit}
-                      onChange={(e) => setLowStockLimit(parseInt(e.target.value) || 20)}
-                      className="w-full px-3.5 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-primary"
-                      required
-                    />
-                    <span className="text-[10px] text-slate-400 mt-1 block leading-normal">
-                      When drug quantities in pharmacy inventory drop below this level, they trigger dashboard alerts.
-                    </span>
+                      <div>
+                        <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">Pharmacy Low Stock Warning Trigger (Count)</label>
+                        <input
+                          type="number"
+                          min={1}
+                          value={lowStockLimit}
+                          onChange={(e) => setLowStockLimit(parseInt(e.target.value) || 20)}
+                          className="w-full px-3.5 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-primary"
+                          required
+                        />
+                        <span className="text-[10px] text-slate-400 mt-1 block leading-normal">
+                          When drug quantities in pharmacy inventory drop below this level, they trigger dashboard alerts.
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Part 2: Device/Push Notification Settings */}
+                  <div className="space-y-4 pt-4 border-t border-slate-100">
+                    <div className="space-y-1 border-b pb-3 flex items-center gap-2">
+                      <Bell className="w-5 h-5 text-slate-500" />
+                      <span className="font-bold text-slate-800 text-sm">Device & Push Notification Preferences</span>
+                    </div>
+
+                    {/* Master Switch */}
+                    <div className="flex items-center justify-between p-4 border rounded-xl bg-slate-50/50">
+                      <div>
+                        <span className="text-xs font-bold text-slate-800 block">Enable Device Notifications</span>
+                        <p className="text-[10px] text-slate-400 mt-0.5">Allows the browser or native app wrapper to display push/local banner notifications.</p>
+                      </div>
+                      <label className="relative inline-flex items-center cursor-pointer">
+                        <input 
+                          type="checkbox" 
+                          checked={notifEnabled} 
+                          onChange={(e) => setNotifEnabled(e.target.checked)}
+                          className="sr-only peer" 
+                        />
+                        <div className="w-9 h-5 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                      </label>
+                    </div>
+
+                    {/* Individual Toggles */}
+                    {notifEnabled && (
+                      <div className="space-y-3 pl-2 animate-fade-slide-up">
+                        {/* New Visit / Join Requests */}
+                        <div className="flex items-center justify-between py-1">
+                          <div>
+                            <span className="text-xs font-semibold text-slate-700 block">Entry & Join Approval Requests</span>
+                            <span className="text-[10px] text-slate-400">Notify when new users register or request approval to access the school sickbay.</span>
+                          </div>
+                          <label className="relative inline-flex items-center cursor-pointer">
+                            <input 
+                              type="checkbox" 
+                              checked={notifVisits} 
+                              onChange={(e) => setNotifVisits(e.target.checked)}
+                              className="sr-only peer" 
+                        />
+                            <div className="w-9 h-5 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                          </label>
+                        </div>
+
+                        {/* Daily Scheduled Medications */}
+                        <div className="flex items-center justify-between py-1 border-t border-slate-50 pt-2">
+                          <div>
+                            <span className="text-xs font-semibold text-slate-700 block">Medication Administration Reminders</span>
+                            <span className="text-[10px] text-slate-400">Notify when a student's scheduled medication dose time is reached.</span>
+                          </div>
+                          <label className="relative inline-flex items-center cursor-pointer">
+                            <input 
+                              type="checkbox" 
+                              checked={notifMeds} 
+                              onChange={(e) => setNotifMeds(e.target.checked)}
+                              className="sr-only peer" 
+                            />
+                            <div className="w-9 h-5 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                          </label>
+                        </div>
+
+                        {/* Low Pharmacy Stock Warnings */}
+                        <div className="flex items-center justify-between py-1 border-t border-slate-50 pt-2">
+                          <div>
+                            <span className="text-xs font-semibold text-slate-700 block">Low Pharmacy Stock Warnings</span>
+                            <span className="text-[10px] text-slate-400">Notify when a pharmacy drug count drops below warning thresholds.</span>
+                          </div>
+                          <label className="relative inline-flex items-center cursor-pointer">
+                            <input 
+                              type="checkbox" 
+                              checked={notifStock} 
+                              onChange={(e) => setNotifStock(e.target.checked)}
+                              className="sr-only peer" 
+                            />
+                            <div className="w-9 h-5 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                          </label>
+                        </div>
+
+                        {/* New Chat Message */}
+                        <div className="flex items-center justify-between py-1 border-t border-slate-50 pt-2">
+                          <div>
+                            <span className="text-xs font-semibold text-slate-700 block">New Chat Messages</span>
+                            <span className="text-[10px] text-slate-400">Notify when other staff members send a message in the clinic portal chatroom.</span>
+                          </div>
+                          <label className="relative inline-flex items-center cursor-pointer">
+                            <input 
+                              type="checkbox" 
+                              checked={notifChat} 
+                              onChange={(e) => setNotifChat(e.target.checked)}
+                              className="sr-only peer" 
+                            />
+                            <div className="w-9 h-5 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                          </label>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

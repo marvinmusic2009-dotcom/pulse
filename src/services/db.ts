@@ -587,6 +587,13 @@ function getTable<T>(key: string): T[] {
 function setTable<T>(key: string, data: T[]): void {
   localStorage.setItem(key, JSON.stringify(data));
   
+  // Dispatch local db update event
+  try {
+    window.dispatchEvent(new Event('pulse-db-updated'));
+  } catch (e) {
+    console.error('Error dispatching pulse-db-updated event:', e);
+  }
+  
   // Background push if cloud sync is enabled
   try {
     const userJson = localStorage.getItem(KEYS.CURRENT_USER);

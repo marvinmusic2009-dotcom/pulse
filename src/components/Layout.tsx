@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { dbService, applySchoolBranding } from '../services/db';
+import { notificationService } from '../services/notificationService';
 import type { School, User, Reminder } from '../services/db';
 import { 
   LayoutDashboard, Users, Pill, Settings, 
@@ -31,6 +32,94 @@ export default function Layout({
   const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
   const [currentUser, setCurrentUser] = useState<User>(user);
   const [isSidebarCollapsed, setSidebarCollapsed] = useState(false);
+
+  const knownReminderIds = React.useRef<Set<string>>(new Set());
+  const knownChatMessageIds = React.useRef<Set<string>>(new Set());
+  const knownPendingUserIds = React.useRef<Set<string>>(new Set());
+
+  // Initialize notification trackers and request permissions on mount
+  useEffect(() => {
+    notificationService.requestPermission();
+    
+    // Populate initial reminders to avoid spamming existing alerts
+    const initialReminders = dbService.getReminders(user.school_id);
+    initialReminders.forEach(r => knownReminderIds.current.add(r.id));
+    
+    // Populate initial chat messages
+    const initialChats = dbService.getChatMessages(user.school_id);
+    initialChats.forEach(c => knownChatMessageIds.current.add(c.id));
+
+    // Populate initial pending users if Admin
+    if (user.role === 'Admin') {
+      const initialPending = dbService.getPendingUsers(user.school_id);
+      initialPending.forEach(u => knownPendingUserIds.current.add(u.id));
+    }
+  }, [user.school_id, user.role]);
+
+  // Monitor new reminders
+  useEffect(() => {
+    reminders.forEach(rem => {
+      if (!knownReminderIds.current.has(rem.id)) {
+        knownReminderIds.current.add(rem.id);
+        
+        let category: 'visitRequests' | 'medicationReminders' | 'lowStockAlerts' = 'lowStockAlerts';
+        if (rem.type === 'missed_dose') category = 'medicationReminders';
+        else if (rem.type === 'low_stock') category = 'lowStockAlerts';
+        
+        notificationService.sendNotification(
+          rem.title,
+          rem.description,
+          category
+        );
+      }
+    });
+  }, [reminders]);
+
+  // Monitor new chat messages and pending join requests
+  useEffect(() => {
+    const checkNewChatsAndApprovals = () => {
+      // 1. Check chat messages
+      const currentChats = dbService.getChatMessages(user.school_id);
+      currentChats.forEach(msg => {
+        if (!knownChatMessageIds.current.has(msg.id)) {
+          knownChatMessageIds.current.add(msg.id);
+          // Only notify if message is sent by someone else
+          if (msg.sender_id !== user.id) {
+            notificationService.sendNotification(
+              `New message from ${msg.sender_name}`,
+              msg.content,
+              'chatMessages'
+            );
+          }
+        }
+      });
+
+      // 2. Check pending approvals if user is Admin
+      if (user.role === 'Admin') {
+        const currentPending = dbService.getPendingUsers(user.school_id);
+        currentPending.forEach(u => {
+          if (!knownPendingUserIds.current.has(u.id)) {
+            knownPendingUserIds.current.add(u.id);
+            notificationService.sendNotification(
+              "New Access Request",
+              `${u.full_name} is requesting access as a ${u.role}.`,
+              'visitRequests'
+            );
+          }
+        });
+      }
+    };
+
+    checkNewChatsAndApprovals();
+    
+    window.addEventListener('pulse-db-synced', checkNewChatsAndApprovals);
+    window.addEventListener('pulse-db-updated', checkNewChatsAndApprovals);
+    
+    return () => {
+      window.removeEventListener('pulse-db-synced', checkNewChatsAndApprovals);
+      window.removeEventListener('pulse-db-updated', checkNewChatsAndApprovals);
+    };
+  }, [user.school_id, user.id, user.role]);
 
   // Sync state and listen for updates
   useEffect(() => {
@@ -65,26 +154,29 @@ export default function Layout({
       setReminders(dbService.getReminders(user.school_id));
     }, 15000);
 
-    // Sync Pull trigger
-    const triggerPull = async () => {
+    // Sync Cycle trigger (Push local changes + Pull cloud updates)
+    const triggerSyncCycle = async () => {
       const activeSchool = dbService.getSchool(user.school_id);
       if (activeSchool && activeSchool.cloud_sync_enabled && activeSchool.cloud_sync_token) {
         setSyncStatus('syncing');
         try {
+          // Push any local offline updates
+          await dbService.pushSchoolCloudState(user.school_id);
+          // Pull latest updates from Supabase and merge
           await dbService.pullSchoolCloudState(user.school_id);
           setSyncStatus('synced');
           setTimeout(() => setSyncStatus('idle'), 2000);
         } catch (e) {
-          console.error('Cloud pull failed:', e);
+          console.error('Cloud sync cycle failed:', e);
           setSyncStatus('error');
         }
       }
     };
 
-    triggerPull();
+    triggerSyncCycle();
 
     const syncInterval = setInterval(() => {
-      triggerPull();
+      triggerSyncCycle();
     }, 20000);
 
     const handleDbSynced = () => {
@@ -97,11 +189,15 @@ export default function Layout({
     };
 
     window.addEventListener('pulse-db-synced', handleDbSynced);
+    window.addEventListener('pulse-db-updated', handleDbSynced);
+    window.addEventListener('online', triggerSyncCycle);
 
     return () => {
       clearInterval(interval);
       clearInterval(syncInterval);
       window.removeEventListener('pulse-db-synced', handleDbSynced);
+      window.removeEventListener('pulse-db-updated', handleDbSynced);
+      window.removeEventListener('online', triggerSyncCycle);
     };
   }, [user]);
 
