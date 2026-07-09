@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { dbService } from '../services/db';
-import type { User } from '../services/db';
+import type { User, School } from '../services/db';
 import { Mail, Lock, User as UserIcon, Search, CheckCircle, Clock, ArrowRight, ShieldAlert, Image as ImageIcon } from 'lucide-react';
 
 interface AuthProps {
@@ -35,23 +35,41 @@ export default function Auth({ onLoginSuccess }: AuthProps) {
   // Current session pending user
   const [currentPendingUser, setCurrentPendingUser] = useState<User | null>(null);
 
-  // Load remember me email
+  // Schools list state
+  const [schools, setSchools] = useState<School[]>([]);
+
+  // Load remember me email and schools list on mount
   useEffect(() => {
     const savedEmail = localStorage.getItem('pulse_remember_email');
     if (savedEmail) {
       setEmail(savedEmail);
       setRememberMe(true);
     }
+
+    // Load local schools first
+    const localSchools = dbService.getSchools();
+    setSchools(localSchools);
+
+    // Fetch from Supabase online
+    const fetchSchools = async () => {
+      try {
+        const remoteSchools = await dbService.getSchoolsOnline();
+        setSchools(remoteSchools);
+      } catch (err) {
+        console.error('Failed to load schools online:', err);
+      }
+    };
+    fetchSchools();
   }, []);
 
   // Handle Login
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setSuccess('');
 
     try {
-      const user = dbService.login(email, password);
+      const user = await dbService.login(email, password);
       
       if (user.status === 'pending') {
         setCurrentPendingUser(user);
@@ -75,7 +93,7 @@ export default function Auth({ onLoginSuccess }: AuthProps) {
   };
 
   // Handle School Admin Registration Submit
-  const handleRegisterSchoolSubmit = (e: React.FormEvent) => {
+  const handleRegisterSchoolSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setSuccess('');
@@ -86,7 +104,7 @@ export default function Auth({ onLoginSuccess }: AuthProps) {
     }
 
     try {
-      const { admin } = dbService.registerSchoolAdmin(
+      const { admin } = await dbService.registerSchoolAdmin(
         schoolName,
         schoolLogo,
         fullName,
@@ -103,7 +121,7 @@ export default function Auth({ onLoginSuccess }: AuthProps) {
   };
 
   // Handle Join School Submit
-  const handleJoinSchoolSubmit = (e: React.FormEvent) => {
+  const handleJoinSchoolSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setSuccess('');
@@ -114,7 +132,7 @@ export default function Auth({ onLoginSuccess }: AuthProps) {
     }
 
     try {
-      const pendingUser = dbService.submitJoinRequest(
+      const pendingUser = await dbService.submitJoinRequest(
         selectedSchoolId,
         fullName,
         email,
@@ -141,7 +159,6 @@ export default function Auth({ onLoginSuccess }: AuthProps) {
   };
 
   // Filter schools for join query
-  const schools = dbService.getSchools();
   const filteredSchools = schools.filter(s => 
     s.name.toLowerCase().includes(schoolSearchQuery.toLowerCase())
   );

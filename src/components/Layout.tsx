@@ -147,9 +147,9 @@ export default function Layout({
     { email: 'admin@oakridge.edu', name: 'Admin Carter (Oakridge)', role: 'Admin' },
   ];
 
-  const handleQuickSwitch = (email: string) => {
+  const handleQuickSwitch = async (email: string) => {
     try {
-      const u = dbService.login(email, 'password123');
+      const u = await dbService.login(email, 'password123');
       onSwitchUser(u);
       setShowUserSwitcher(false);
       setActiveTab('dashboard');

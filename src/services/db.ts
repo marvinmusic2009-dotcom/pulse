@@ -1,4 +1,5 @@
 // Database Simulation Service for "Pulse" (School Sickbay Management System)
+import { supabase } from './supabaseClient';
 
 export interface School {
   id: string;
@@ -737,13 +738,18 @@ export const dbService = {
     return updatedSchool;
   },
 
-  registerSchoolAdmin(schoolName: string, logoUrl: string, adminName: string, email: string, password_hash: string): { school: School; admin: User } {
+  async registerSchoolAdmin(schoolName: string, logoUrl: string, adminName: string, email: string, password_hash: string): Promise<{ school: School; admin: User }> {
     const schools = getTable<School>(KEYS.SCHOOLS);
     const users = getTable<User>(KEYS.USERS);
 
-    // Verify unique email
-    if (users.some(u => u.email.toLowerCase() === email.toLowerCase())) {
-      throw new Error('Email is already registered.');
+    // Verify unique email in local/Supabase
+    try {
+      const { data: existingUser } = await supabase.from('users').select('id').eq('email', email.toLowerCase()).maybeSingle();
+      if (existingUser || users.some(u => u.email.toLowerCase() === email.toLowerCase())) {
+        throw new Error('Email is already registered.');
+      }
+    } catch (e: any) {
+      if (e.message === 'Email is already registered.') throw e;
     }
 
     const schoolId = uuidv4();
@@ -754,6 +760,8 @@ export const dbService = {
       primary_color: '#0284c7', // Default sky blue
       secondary_color: '#0f172a', // Default slate
       created_at: new Date().toISOString(),
+      cloud_sync_enabled: true,
+      cloud_sync_token: schoolId,
     };
 
     const adminId = uuidv4();
@@ -768,6 +776,17 @@ export const dbService = {
       created_at: new Date().toISOString(),
     };
 
+    // Attempt Supabase insert
+    try {
+      const { error: schoolError } = await supabase.from('schools').insert(newSchool);
+      if (schoolError) throw new Error(`School registration failed on server: ${schoolError.message}`);
+
+      const { error: userError } = await supabase.from('users').insert(newAdmin);
+      if (userError) throw new Error(`Admin user registration failed on server: ${userError.message}`);
+    } catch (err: any) {
+      console.error('Supabase registration error, saving locally only:', err);
+    }
+
     schools.push(newSchool);
     users.push(newAdmin);
 
@@ -779,11 +798,16 @@ export const dbService = {
     return { school: newSchool, admin: newAdmin };
   },
 
-  submitJoinRequest(schoolId: string, fullName: string, email: string, password_hash: string, role: User['role']): User {
+  async submitJoinRequest(schoolId: string, fullName: string, email: string, password_hash: string, role: User['role']): Promise<User> {
     const users = getTable<User>(KEYS.USERS);
 
-    if (users.some(u => u.email.toLowerCase() === email.toLowerCase())) {
-      throw new Error('Email is already registered.');
+    try {
+      const { data: existingUser } = await supabase.from('users').select('id').eq('email', email.toLowerCase()).maybeSingle();
+      if (existingUser || users.some(u => u.email.toLowerCase() === email.toLowerCase())) {
+        throw new Error('Email is already registered.');
+      }
+    } catch (e: any) {
+      if (e.message === 'Email is already registered.') throw e;
     }
 
     const userId = uuidv4();
@@ -797,6 +821,13 @@ export const dbService = {
       status: 'pending',
       created_at: new Date().toISOString(),
     };
+
+    try {
+      const { error } = await supabase.from('users').insert(newUser);
+      if (error) throw new Error(`Join request failed on server: ${error.message}`);
+    } catch (err) {
+      console.error('Supabase join request error, saving locally only:', err);
+    }
 
     users.push(newUser);
     setTable(KEYS.USERS, users);
@@ -821,7 +852,7 @@ export const dbService = {
     addAuditLog(schoolId, adminId, adminName, 'User Approved', `Approved user: ${users[index].full_name} (${users[index].role})`);
   },
 
-  rejectUser(schoolId: string, adminId: string, adminName: string, userId: string): void {
+  async rejectUser(schoolId: string, adminId: string, adminName: string, userId: string): Promise<void> {
     const users = getTable<User>(KEYS.USERS);
     const index = users.findIndex(u => u.id === userId && u.school_id === schoolId);
     if (index === -1) throw new Error('User not found in this school');
@@ -831,6 +862,12 @@ export const dbService = {
     users.splice(index, 1);
     setTable(KEYS.USERS, users);
 
+    try {
+      await supabase.from('users').delete().eq('id', userId);
+    } catch (err) {
+      console.error('Supabase rejectUser error:', err);
+    }
+
     addAuditLog(schoolId, adminId, adminName, 'User Rejected', `Rejected and deleted join request for: ${name} (${role})`);
   },
 
@@ -838,13 +875,60 @@ export const dbService = {
     return getTable<User>(KEYS.USERS).filter(u => u.school_id === schoolId && u.status === 'approved');
   },
 
-  login(email: string, password_hash: string): User {
-    const users = getTable<User>(KEYS.USERS);
-    const user = users.find(u => u.email.toLowerCase() === email.toLowerCase() && u.password_hash === password_hash);
-    if (!user) {
-      throw new Error('Invalid email or password.');
+  async login(email: string, password_hash: string): Promise<User> {
+    let user: User | null = null;
+    try {
+      const { data, error } = await supabase
+        .from('users')
+        .select('*')
+        .eq('email', email.toLowerCase())
+        .eq('password_hash', password_hash)
+        .maybeSingle();
+      if (error) throw error;
+      if (data) {
+        user = data as User;
+      }
+    } catch (err) {
+      console.warn('Supabase login failed, using local storage fallback...', err);
     }
+
+    if (!user) {
+      const users = getTable<User>(KEYS.USERS);
+      const localUser = users.find(u => u.email.toLowerCase() === email.toLowerCase() && u.password_hash === password_hash);
+      if (!localUser) {
+        throw new Error('Invalid email or password.');
+      }
+      user = localUser;
+    }
+
+    if (user && user.status === 'approved') {
+      try {
+        await this.pullSchoolCloudState(user.school_id);
+      } catch (err) {
+        console.error('Failed to sync school state on login:', err);
+      }
+    }
+
     return user;
+  },
+
+  async getSchoolsOnline(): Promise<School[]> {
+    try {
+      const { data, error } = await supabase.from('schools').select('*');
+      if (error) throw error;
+      if (data) {
+        const localSchools = getTable<School>(KEYS.SCHOOLS);
+        const mergedMap = new Map<string, School>();
+        localSchools.forEach(s => mergedMap.set(s.id, s));
+        data.forEach((s: any) => mergedMap.set(s.id, s));
+        const merged = Array.from(mergedMap.values());
+        localStorage.setItem(KEYS.SCHOOLS, JSON.stringify(merged));
+        return merged;
+      }
+    } catch (e) {
+      console.warn('Failed to load schools from Supabase, using local:', e);
+    }
+    return getTable<School>(KEYS.SCHOOLS);
   },
 
   // --- PATIENTS ---
@@ -892,7 +976,7 @@ export const dbService = {
     return updated;
   },
 
-  deletePatient(schoolId: string, adminId: string, adminName: string, patientId: string): void {
+  async deletePatient(schoolId: string, adminId: string, adminName: string, patientId: string): Promise<void> {
     const patients = getTable<Patient>(KEYS.PATIENTS);
     const index = patients.findIndex(p => p.id === patientId && p.school_id === schoolId);
     if (index === -1) throw new Error('Patient not found');
@@ -910,6 +994,17 @@ export const dbService = {
 
     const logs = getTable<DrugLog>(KEYS.DRUG_LOGS).filter(l => l.patient_id !== patientId);
     setTable(KEYS.DRUG_LOGS, logs);
+
+    try {
+      await Promise.all([
+        supabase.from('patients').delete().eq('id', patientId),
+        supabase.from('visits').delete().eq('patient_id', patientId),
+        supabase.from('drug_schedules').delete().eq('patient_id', patientId),
+        supabase.from('drug_logs').delete().eq('patient_id', patientId),
+      ]);
+    } catch (err) {
+      console.error('Supabase deletePatient error:', err);
+    }
 
     addAuditLog(schoolId, adminId, adminName, 'Patient Deleted', `Deleted student record and files for: ${name}`);
   },
@@ -1460,118 +1555,157 @@ export const dbService = {
   // --- ONLINE SYNC ENGINE ---
   async pushSchoolCloudState(schoolId: string): Promise<void> {
     const school = this.getSchool(schoolId);
-    if (!school || !school.cloud_sync_token) return;
+    if (!school) return;
 
-    // Package all records for this school
-    const state = {
-      timestamp: new Date().toISOString(),
-      school,
-      users: getTable<User>(KEYS.USERS).filter(u => u.school_id === schoolId),
-      patients: getTable<Patient>(KEYS.PATIENTS).filter(p => p.school_id === schoolId),
-      visits: getTable<Visit>(KEYS.VISITS).filter(v => v.school_id === schoolId),
-      schedules: getTable<DrugSchedule>(KEYS.DRUG_SCHEDULES).filter(s => s.school_id === schoolId),
-      logs: getTable<DrugLog>(KEYS.DRUG_LOGS).filter(l => l.school_id === schoolId),
-      inventory: getTable<InventoryItem>(KEYS.INVENTORY).filter(i => i.school_id === schoolId),
-      appointments: getTable<Appointment>(KEYS.APPOINTMENTS).filter(a => a.school_id === schoolId),
-      vaccinations: getTable<Vaccination>(KEYS.VACCINATIONS).filter(v => v.school_id === schoolId),
-      labs: getTable<LabResult>(KEYS.LAB_RESULTS).filter(l => l.school_id === schoolId),
-      reports: getTable<NurseReport>(KEYS.REPORTS).filter(r => r.school_id === schoolId),
-      chat_messages: getTable<ChatMessage>(KEYS.CHAT_MESSAGES).filter(m => m.school_id === schoolId),
-    };
+    try {
+      // 1. Push school
+      await supabase.from('schools').upsert(school);
 
-    const url = `https://kvdb.io/${school.cloud_sync_token}/db_state`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(state)
-    });
-    if (!res.ok) {
-      throw new Error(`Sync upload failed: ${res.statusText}`);
+      // 2. Push users
+      const users = getTable<User>(KEYS.USERS).filter(u => u.school_id === schoolId);
+      if (users.length > 0) await supabase.from('users').upsert(users);
+
+      // 3. Push patients
+      const patients = getTable<Patient>(KEYS.PATIENTS).filter(p => p.school_id === schoolId);
+      if (patients.length > 0) await supabase.from('patients').upsert(patients);
+
+      // 4. Push visits
+      const visits = getTable<Visit>(KEYS.VISITS).filter(v => v.school_id === schoolId);
+      if (visits.length > 0) await supabase.from('visits').upsert(visits);
+
+      // 5. Push schedules
+      const schedules = getTable<DrugSchedule>(KEYS.DRUG_SCHEDULES).filter(s => s.school_id === schoolId);
+      if (schedules.length > 0) await supabase.from('drug_schedules').upsert(schedules);
+
+      // 6. Push logs
+      const logs = getTable<DrugLog>(KEYS.DRUG_LOGS).filter(l => l.school_id === schoolId);
+      if (logs.length > 0) await supabase.from('drug_logs').upsert(logs);
+
+      // 7. Push inventory
+      const inventory = getTable<InventoryItem>(KEYS.INVENTORY).filter(i => i.school_id === schoolId);
+      if (inventory.length > 0) await supabase.from('inventory').upsert(inventory);
+
+      // 8. Push appointments
+      const appointments = getTable<Appointment>(KEYS.APPOINTMENTS).filter(a => a.school_id === schoolId);
+      if (appointments.length > 0) await supabase.from('appointments').upsert(appointments);
+
+      // 9. Push vaccinations
+      const vaccinations = getTable<Vaccination>(KEYS.VACCINATIONS).filter(v => v.school_id === schoolId);
+      if (vaccinations.length > 0) await supabase.from('vaccinations').upsert(vaccinations);
+
+      // 10. Push labs
+      const labs = getTable<LabResult>(KEYS.LAB_RESULTS).filter(l => l.school_id === schoolId);
+      if (labs.length > 0) await supabase.from('lab_results').upsert(labs);
+
+      // 11. Push reports
+      const reports = getTable<NurseReport>(KEYS.REPORTS).filter(r => r.school_id === schoolId);
+      if (reports.length > 0) await supabase.from('reports').upsert(reports);
+
+      // 12. Push chat messages
+      const chat_messages = getTable<ChatMessage>(KEYS.CHAT_MESSAGES).filter(m => m.school_id === schoolId);
+      if (chat_messages.length > 0) await supabase.from('chat_messages').upsert(chat_messages);
+
+      // 13. Push audit logs
+      const audit_logs = getTable<AuditLog>(KEYS.AUDIT_LOGS).filter(a => a.school_id === schoolId);
+      if (audit_logs.length > 0) await supabase.from('audit_logs').upsert(audit_logs);
+
+    } catch (err) {
+      console.error('Supabase pushSchoolCloudState failed:', err);
+      throw err;
     }
   },
 
   async pullSchoolCloudState(schoolId: string): Promise<void> {
     const school = this.getSchool(schoolId);
-    if (!school || !school.cloud_sync_token) return;
+    if (!school) return;
 
-    const url = `https://kvdb.io/${school.cloud_sync_token}/db_state`;
-    let res;
     try {
-      res = await fetch(url);
-    } catch (e) {
-      console.warn('Sync server connection error - operating offline.');
-      return;
+      // Fetch all tables concurrently
+      const [
+        { data: remoteSchools, error: schoolErr },
+        { data: users, error: userErr },
+        { data: patients, error: patientErr },
+        { data: visits, error: visitErr },
+        { data: schedules, error: scheduleErr },
+        { data: logs, error: logErr },
+        { data: inventory, error: inventoryErr },
+        { data: appointments, error: appErr },
+        { data: vaccinations, error: vacErr },
+        { data: labs, error: labErr },
+        { data: reports, error: reportErr },
+        { data: chat_messages, error: chatErr },
+        { data: audit_logs, error: auditErr }
+      ] = await Promise.all([
+        supabase.from('schools').select('*').eq('id', schoolId),
+        supabase.from('users').select('*').eq('school_id', schoolId),
+        supabase.from('patients').select('*').eq('school_id', schoolId),
+        supabase.from('visits').select('*').eq('school_id', schoolId),
+        supabase.from('drug_schedules').select('*').eq('school_id', schoolId),
+        supabase.from('drug_logs').select('*').eq('school_id', schoolId),
+        supabase.from('inventory').select('*').eq('school_id', schoolId),
+        supabase.from('appointments').select('*').eq('school_id', schoolId),
+        supabase.from('vaccinations').select('*').eq('school_id', schoolId),
+        supabase.from('lab_results').select('*').eq('school_id', schoolId),
+        supabase.from('reports').select('*').eq('school_id', schoolId),
+        supabase.from('chat_messages').select('*').eq('school_id', schoolId),
+        supabase.from('audit_logs').select('*').eq('school_id', schoolId)
+      ]);
+
+      if (schoolErr) throw schoolErr;
+      if (userErr) throw userErr;
+      if (patientErr) throw patientErr;
+      if (visitErr) throw visitErr;
+      if (scheduleErr) throw scheduleErr;
+      if (logErr) throw logErr;
+      if (inventoryErr) throw inventoryErr;
+      if (appErr) throw appErr;
+      if (vacErr) throw vacErr;
+      if (labErr) throw labErr;
+      if (reportErr) throw reportErr;
+      if (chatErr) throw chatErr;
+      if (auditErr) throw auditErr;
+
+      const remoteSchool = remoteSchools?.[0];
+      if (!remoteSchool) {
+        // If school is not found on server, push our local state to populate it
+        await this.pushSchoolCloudState(schoolId);
+        return;
+      }
+
+      const mergeLists = <T extends { id: string }>(localList: T[], cloudList: T[] | null, filterFn: (item: T) => boolean): T[] => {
+        const otherSchoolsData = localList.filter(item => !filterFn(item));
+        const activeSchoolLocal = localList.filter(filterFn);
+        
+        const mergedMap = new Map<string, T>();
+        activeSchoolLocal.forEach(item => mergedMap.set(item.id, item));
+        if (cloudList) {
+          cloudList.forEach(item => mergedMap.set(item.id, item));
+        }
+        
+        return [...otherSchoolsData, ...mergedMap.values()];
+      };
+
+      // Update local storage tables
+      const schools = getTable<School>(KEYS.SCHOOLS);
+      const otherSchools = schools.filter(s => s.id !== schoolId);
+      setTable(KEYS.SCHOOLS, [...otherSchools, remoteSchool]);
+
+      if (users) setTable(KEYS.USERS, mergeLists(getTable<User>(KEYS.USERS), users, u => u.school_id === schoolId));
+      if (patients) setTable(KEYS.PATIENTS, mergeLists(getTable<Patient>(KEYS.PATIENTS), patients, p => p.school_id === schoolId));
+      if (visits) setTable(KEYS.VISITS, mergeLists(getTable<Visit>(KEYS.VISITS), visits, v => v.school_id === schoolId));
+      if (schedules) setTable(KEYS.DRUG_SCHEDULES, mergeLists(getTable<DrugSchedule>(KEYS.DRUG_SCHEDULES), schedules, s => s.school_id === schoolId));
+      if (logs) setTable(KEYS.DRUG_LOGS, mergeLists(getTable<DrugLog>(KEYS.DRUG_LOGS), logs, l => l.school_id === schoolId));
+      if (inventory) setTable(KEYS.INVENTORY, mergeLists(getTable<InventoryItem>(KEYS.INVENTORY), inventory, i => i.school_id === schoolId));
+      if (appointments) setTable(KEYS.APPOINTMENTS, mergeLists(getTable<Appointment>(KEYS.APPOINTMENTS), appointments, a => a.school_id === schoolId));
+      if (vaccinations) setTable(KEYS.VACCINATIONS, mergeLists(getTable<Vaccination>(KEYS.VACCINATIONS), vaccinations, v => v.school_id === schoolId));
+      if (labs) setTable(KEYS.LAB_RESULTS, mergeLists(getTable<LabResult>(KEYS.LAB_RESULTS), labs, l => l.school_id === schoolId));
+      if (reports) setTable(KEYS.REPORTS, mergeLists(getTable<NurseReport>(KEYS.REPORTS), reports, r => r.school_id === schoolId));
+      if (chat_messages) setTable(KEYS.CHAT_MESSAGES, mergeLists(getTable<ChatMessage>(KEYS.CHAT_MESSAGES), chat_messages, m => m.school_id === schoolId));
+      if (audit_logs) setTable(KEYS.AUDIT_LOGS, mergeLists(getTable<AuditLog>(KEYS.AUDIT_LOGS), audit_logs, a => a.school_id === schoolId));
+
+      window.dispatchEvent(new Event('pulse-db-synced'));
+    } catch (err) {
+      console.warn('Sync pull failed or server offline - operating offline.', err);
     }
-    if (res.status === 404) {
-      await this.pushSchoolCloudState(schoolId);
-      return;
-    }
-    if (!res.ok) {
-      throw new Error(`Sync download failed: ${res.statusText}`);
-    }
-
-    const cloudState = await res.json();
-    if (!cloudState || !cloudState.school) return;
-
-    const mergeLists = <T extends { id: string }>(localList: T[], cloudList: T[], filterFn: (item: T) => boolean): T[] => {
-      const otherSchoolsData = localList.filter(item => !filterFn(item));
-      const activeSchoolLocal = localList.filter(filterFn);
-      
-      const mergedMap = new Map<string, T>();
-      activeSchoolLocal.forEach(item => mergedMap.set(item.id, item));
-      cloudList.forEach(item => mergedMap.set(item.id, item));
-      
-      return [...otherSchoolsData, ...mergedMap.values()];
-    };
-
-    const schools = getTable<School>(KEYS.SCHOOLS);
-    const otherSchools = schools.filter(s => s.id !== schoolId);
-    setTable(KEYS.SCHOOLS, [...otherSchools, cloudState.school]);
-
-    const users = getTable<User>(KEYS.USERS);
-    const mergedUsers = mergeLists(users, cloudState.users, u => u.school_id === schoolId);
-    setTable(KEYS.USERS, mergedUsers);
-
-    const patients = getTable<Patient>(KEYS.PATIENTS);
-    const mergedPatients = mergeLists(patients, cloudState.patients, p => p.school_id === schoolId);
-    setTable(KEYS.PATIENTS, mergedPatients);
-
-    const visits = getTable<Visit>(KEYS.VISITS);
-    const mergedVisits = mergeLists(visits, cloudState.visits, v => v.school_id === schoolId);
-    setTable(KEYS.VISITS, mergedVisits);
-
-    const schedules = getTable<DrugSchedule>(KEYS.DRUG_SCHEDULES);
-    const mergedSchedules = mergeLists(schedules, cloudState.schedules, s => s.school_id === schoolId);
-    setTable(KEYS.DRUG_SCHEDULES, mergedSchedules);
-
-    const logs = getTable<DrugLog>(KEYS.DRUG_LOGS);
-    const mergedLogs = mergeLists(logs, cloudState.logs, l => l.school_id === schoolId);
-    setTable(KEYS.DRUG_LOGS, mergedLogs);
-
-    const inventory = getTable<InventoryItem>(KEYS.INVENTORY);
-    const mergedInventory = mergeLists(inventory, cloudState.inventory, i => i.school_id === schoolId);
-    setTable(KEYS.INVENTORY, mergedInventory);
-
-    const appointments = getTable<Appointment>(KEYS.APPOINTMENTS);
-    const mergedAppointments = mergeLists(appointments, cloudState.appointments, a => a.school_id === schoolId);
-    setTable(KEYS.APPOINTMENTS, mergedAppointments);
-
-    const vaccinations = getTable<Vaccination>(KEYS.VACCINATIONS);
-    const mergedVaccinations = mergeLists(vaccinations, cloudState.vaccinations, v => v.school_id === schoolId);
-    setTable(KEYS.VACCINATIONS, mergedVaccinations);
-
-    const labs = getTable<LabResult>(KEYS.LAB_RESULTS);
-    const mergedLabs = mergeLists(labs, cloudState.labs, l => l.school_id === schoolId);
-    setTable(KEYS.LAB_RESULTS, mergedLabs);
-
-    const reports = getTable<NurseReport>(KEYS.REPORTS);
-    const mergedReports = mergeLists(reports, cloudState.reports, r => r.school_id === schoolId);
-    setTable(KEYS.REPORTS, mergedReports);
-
-    const chat_messages = getTable<ChatMessage>(KEYS.CHAT_MESSAGES);
-    const mergedChats = mergeLists(chat_messages, cloudState.chat_messages || [], m => m.school_id === schoolId);
-    setTable(KEYS.CHAT_MESSAGES, mergedChats);
-
-    window.dispatchEvent(new Event('pulse-db-synced'));
   },
 };
