@@ -173,6 +173,110 @@ export default function PatientDirectory({ user, onSelectPatient, setActiveTab }
     }
   };
 
+  // Bulk import patients from text/CSV file
+  const handleBulkImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      const text = event.target?.result as string;
+      if (!text) return;
+
+      const lines = text.split('\n');
+      let successCount = 0;
+      let errorCount = 0;
+      const errors: string[] = [];
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        // Skip header or empty lines
+        if (!line || line.startsWith('Name,') || line.startsWith('name,')) {
+          continue;
+        }
+
+        const cols = line.split(',');
+        if (cols.length < 5) {
+          errorCount++;
+          errors.push(`Line ${i + 1}: Invalid format (must have at least 5 columns)`);
+          continue;
+        }
+
+        const [name, studentId, genderVal, dob, className] = cols.map(c => c.trim());
+        if (!name || !studentId || !dob || !className) {
+          errorCount++;
+          errors.push(`Line ${i + 1}: Missing required fields`);
+          continue;
+        }
+
+        // Validate gender
+        let gender: 'Male' | 'Female' | 'Other' = 'Other';
+        if (genderVal.toLowerCase() === 'male') gender = 'Male';
+        else if (genderVal.toLowerCase() === 'female') gender = 'Female';
+
+        // Parse allergies
+        const allergies: { allergen: string; severity: 'mild' | 'moderate' | 'severe' }[] = [];
+        if (cols[5]) {
+          const allergyParts = cols[5].split(';');
+          allergyParts.forEach(part => {
+            const trimmed = part.trim();
+            if (!trimmed) return;
+            const subparts = trimmed.split(':');
+            const allergen = subparts[0].trim();
+            let severity: 'mild' | 'moderate' | 'severe' = 'mild';
+            if (subparts[1]) {
+              const sev = subparts[1].trim().toLowerCase();
+              if (sev === 'severe') severity = 'severe';
+              else if (sev === 'moderate') severity = 'moderate';
+            }
+            allergies.push({ allergen, severity });
+          });
+        }
+
+        // Parse ongoing conditions
+        const ongoing_conditions: string[] = [];
+        if (cols[6]) {
+          cols[6].split(';').forEach(c => {
+            const trimmed = c.trim();
+            if (trimmed) ongoing_conditions.push(trimmed);
+          });
+        }
+
+        // Parse regular medications
+        const regular_medications: string[] = [];
+        if (cols[7]) {
+          cols[7].split(';').forEach(m => {
+            const trimmed = m.trim();
+            if (trimmed) regular_medications.push(trimmed);
+          });
+        }
+
+        try {
+          dbService.addPatient(schoolId, user.id, user.full_name, {
+            name,
+            student_id: studentId,
+            gender,
+            dob,
+            class_name: className,
+            allergies,
+            ongoing_conditions,
+            regular_medications,
+          });
+          successCount++;
+        } catch (err: any) {
+          errorCount++;
+          errors.push(`Line ${i + 1} (${name}): ${err.message || 'Unknown error'}`);
+        }
+      }
+
+      alert(`Import Completed!\n\nSuccessful imports: ${successCount}\nFailed imports: ${errorCount}${errors.length > 0 ? '\n\nErrors:\n' + errors.slice(0, 5).join('\n') + (errors.length > 5 ? '\n...and more' : '') : ''}`);
+      loadPatients();
+    };
+
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
   return (
     <div className="relative min-h-[calc(100vh-8rem)]">
       
@@ -194,11 +298,21 @@ export default function PatientDirectory({ user, onSelectPatient, setActiveTab }
           <div className="flex w-full md:w-auto gap-2">
             <button
               onClick={() => setShowAddModal(true)}
-              className="w-full md:w-auto flex items-center justify-center gap-2 px-5 py-3 bg-primary hover:bg-primary-hover text-white font-medium rounded-xl text-sm transition shadow-lg shadow-primary/10"
+              className="flex-1 md:flex-none flex items-center justify-center gap-2 px-5 py-3 bg-primary hover:bg-primary-hover text-white font-medium rounded-xl text-sm transition shadow-lg shadow-primary/10"
             >
               <Plus className="w-4 h-4" />
               <span>Create Student File</span>
             </button>
+            <label className="flex-1 md:flex-none flex items-center justify-center gap-2 px-5 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium rounded-xl text-sm transition cursor-pointer border border-slate-200">
+              <FileText className="w-4 h-4" />
+              <span>Import (.txt/.csv)</span>
+              <input
+                type="file"
+                accept=".txt,.csv"
+                onChange={handleBulkImport}
+                className="hidden"
+              />
+            </label>
           </div>
         </div>
 
